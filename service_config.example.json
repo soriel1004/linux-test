@@ -1,0 +1,9 @@
+{
+  "interfaces": [],
+  "interval_seconds": 1,
+  "log_mb": 10,
+  "backups": 9,
+  "nic_detail_interval_seconds": 60,
+  "max_sessions": 5,
+  "max_total_mb": 512
+}

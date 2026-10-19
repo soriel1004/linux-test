@@ -11,6 +11,66 @@
 | `wire_test.py` | 두 LAN 포트를 케이블로 직접 연결해 양방향 프레임 송수신·손실·링크 검사 | 아니요 |
 | `lan_diag.py` | 장시간 NIC 오류·드롭·커널·CPU·메모리·온도 기록, 선택적 Ping/TCP/영상 heartbeat 확인 | 아니요. 실제 카메라 응답 검사는 필요 |
 
+## 다운로드·설치·부팅 시 자동 시작
+
+**Ubuntu 20.04 이상, Python 3.8 이상, systemd를 사용하는 실제 장비**에서 아래 명령을 실행하세요. 인터넷과 관리자 권한이 필요합니다. 카메라나 케이블 없이도 설치하고 기록을 시작할 수 있습니다.
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/soriel1004/linux-test/main/install.sh \
+  -o install-lan-diag.sh && sudo bash install-lan-diag.sh
+```
+
+설치 스크립트는 다음 작업을 수행합니다.
+
+1. Python·Git·iproute2·ethtool·ping 등 필요한 패키지를 서명 검증이 유지되는 APT로 설치합니다.
+2. GitHub의 `main` 소스를 HTTPS로 내려받아 `/opt/lan-diag/releases/`에 설치합니다. 내려받은 커밋을 화면에 표시하고 실행 버전은 `/opt/lan-diag/current`로 연결합니다.
+3. `/etc/lan-diag/config.json`에 기본 설정을 만듭니다. 재설치하면 기존 설정과 로그를 보존하며, 덮어쓸 서비스 유닛이 수정되어 있으면 백업합니다.
+4. `lan-diag.service`를 등록·활성화하고 **즉시 기록을 시작**합니다. 이후 재부팅 때도 자동으로 시작하고, 비정상 종료되면 systemd가 재시작합니다.
+5. 최대 180초 동안 새 샘플이 실제 기록되는지 확인합니다. 서비스 등록만 성공하고 기록이 안 되는 경우에는 설치 성공으로 표시하지 않습니다.
+
+자동 서비스는 **네트워크 설정을 변경하지 않는 수동 기록 모드**입니다. 실제 물리 Ethernet 포트를 자동 탐지하므로 처음 설치할 때 포트 이름을 입력할 필요가 없습니다. `carrier=0`인 미연결 포트도 기록합니다. Ping/TCP 검사, 포트 부하 시험, CPU 스트레스는 자동으로 실행하지 않습니다. 포트 부하 시험은 케이블 연결을 확인한 뒤 아래 절차로 직접 실행합니다.
+
+기본 로그 위치는 `/var/log/lan-diag/session-…/run-…/`입니다. 실행별 약 100 MiB로 순환 저장하고, 서비스가 만든 세션은 기본 최대 5개·총 512 MiB를 기준으로 오래된 것부터 삭제합니다. 실행 중인 세션은 삭제하지 않습니다. 설정 한도는 표시된 크기에 대한 보관 기준이며 파일시스템 블록 사용량의 엄격한 할당 제한은 아닙니다. **오래된 장애 기록은 삭제되기 전에 별도 복사**하세요. 수동 실행 로그·사용자가 넣은 파일·설치된 이전 버전은 이 정리 대상이 아닙니다.
+
+상태와 동작 로그 확인:
+
+```bash
+sudo systemctl status lan-diag.service --no-pager
+sudo journalctl -u lan-diag.service -n 50 --no-pager
+sudo python3 /opt/lan-diag/current/service_runner.py --health
+sudo ls -lt /var/log/lan-diag
+```
+
+`--health`는 최근 30초 안에 샘플이 있는지 확인합니다. 서비스 실행 여부는 `systemctl status`로 함께 확인하세요. 재부팅 시험은 작업을 안전하게 중단한 뒤 수행하고, 위 명령으로 새 세션과 샘플 생성을 확인합니다. 설치 스크립트가 제품을 자동 재부팅하지는 않습니다.
+
+설정 변경·재시작·중단:
+
+```bash
+sudo nano /etc/lan-diag/config.json
+sudo python3 /opt/lan-diag/current/service_runner.py --check
+sudo systemctl restart lan-diag.service
+
+# 현재 기록 중단 (다음 부팅에는 다시 자동 시작)
+sudo systemctl stop lan-diag.service
+
+# 현재 기록과 부팅 자동 시작을 모두 중단 (로그·설정은 보존)
+sudo systemctl disable --now lan-diag.service
+```
+
+기본 설정은 `service_config.example.json`에 있습니다. `interfaces: []`는 서비스 시작 시 물리 Ethernet 포트를 탐지한다는 뜻입니다. 특정 포트만 기록하려면 실제 이름을 배열로 지정하세요. 지정 포트가 부팅 시 아직 없으면 준비될 때까지 기다립니다. 실행 중 새로 추가한 NIC를 포함하려면 서비스를 재시작합니다. `interval_seconds`, `log_mb`, `backups`, `nic_detail_interval_seconds`, `max_sessions`, `max_total_mb`를 조절할 수 있습니다. 기록을 계속하기 위해 총 용량은 최소한 한 세션의 로그 링 용량보다 5 MiB 커야 합니다.
+
+프로그램 업데이트는 같은 설치 명령을 다시 실행하면 됩니다. 특정 Git 커밋으로 고정하려면 `sudo bash install-lan-diag.sh --ref 전체커밋SHA`를 사용하세요. 설치 시 해당 서비스가 재시작되어 새 세션을 만들며 기존 설정은 유지됩니다. 이전 소스 버전은 `/opt/lan-diag/releases/`에 보존됩니다. 직접 변경한 systemd 설정은 유닛을 수정하는 대신 `sudo systemctl edit lan-diag.service`로 drop-in을 만드는 방식을 권장합니다.
+
+인터넷이 없는 장비에서는 저장소 파일 전체를 USB 등으로 옮긴 뒤, 필요한 패키지가 이미 설치된 경우 다음처럼 설치할 수 있습니다.
+
+```bash
+sudo bash install.sh --source-dir "$PWD" --skip-packages
+```
+
+`--skip-packages`는 APT 설치를 생략할 뿐입니다. 필수 명령이 없으면 설치를 중단합니다. 테스트를 위해 실제 OS에 설치하지 않고 파일 배치만 확인하려면 `bash install.sh --source-dir "$PWD" --destdir /tmp/lan-diag-stage`를 사용합니다. 이 모드는 패키지 설치와 서비스 등록·시작을 하지 않습니다.
+
 ## 1. 준비와 포트 확인
 
 준비물은 입고 장비, 정상 확인된 Cat5e 또는 Cat6 케이블 1~2개, 로컬 화면·키보드입니다. 포트는 P1~P5로 표시하고, 우분투 인터페이스 이름과 실물 위치를 대응시켜 기록합니다. 외장 PC가 있으면 독립된 상대 장비로 추가 검증할 수 있습니다.
