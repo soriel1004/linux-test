@@ -8,8 +8,12 @@ ref='main'
 source_dir=''
 destdir=''
 skip_packages=0
+refresh=0
 temporary=''
 stage=''
+cache_stage=''
+files=(lan_diag.py wire_test.py service_runner.py targets.example.json service_config.example.json README.md VALIDATION.md)
+download_files=("${files[@]}" lan-diag.service)
 
 usage() {
     cat <<'EOF'
@@ -17,11 +21,12 @@ Usage: sudo bash install.sh [options]
   --ref REF          Git branch/tag/full commit (default: main)
   --source-dir DIR   Install local downloaded files instead of fetching GitHub
   --skip-packages    Use already installed packages (offline installation)
+  --refresh          Fetch source again even when a valid download cache exists
   --destdir DIR      Stage files under DIR only; no apt, systemctl or root needed
   --help            Show this help
 
-Default: download files, install packages, preserve existing config, enable the
-lan-diag.service and verify a fresh passive capture sample. No load test runs.
+Default: reuse verified downloads and installed packages; download only when
+missing/incomplete. Preserve config, enable the service and verify a fresh sample.
 EOF
 }
 
@@ -29,6 +34,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 cleanup() {
     if [[ -n "$stage" && -d "$stage" ]]; then rm -rf -- "$stage"; fi
     if [[ -n "$temporary" && -d "$temporary" ]]; then rm -rf -- "$temporary"; fi
+    if [[ -n "$cache_stage" && -d "$cache_stage" ]]; then rm -rf -- "$cache_stage"; fi
 }
 trap cleanup EXIT
 trap 'printf "Installation failed at line %s. Existing config/logs are preserved.\n" "$LINENO" >&2' ERR
@@ -44,6 +50,7 @@ while (($#)); do
             esac
             shift 2 ;;
         --skip-packages) skip_packages=1; shift ;;
+        --refresh) refresh=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -65,9 +72,21 @@ else
     [[ -d /run/systemd/system ]] || die 'systemd must be running (not a plain container/WSL without systemd)'
     command -v systemctl >/dev/null || die 'systemctl is required'
     if ((skip_packages == 0)); then
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            python3 git ca-certificates iproute2 ethtool iputils-ping
+        packages=(python3 git ca-certificates iproute2 ethtool iputils-ping)
+        missing_packages=()
+        for package in "${packages[@]}"; do
+            if [[ "$(dpkg-query -W -f='${Status}' -- "$package" 2>/dev/null || true)" == 'install ok installed' ]]; then
+                printf 'SKIP installed package: %s\n' "$package"
+            else
+                missing_packages+=("$package")
+            fi
+        done
+        if ((${#missing_packages[@]})); then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+        else
+            printf 'SKIP APT: all required packages are already installed.\n'
+        fi
     fi
     for tool in python3 ip ethtool ping journalctl; do
         command -v "$tool" >/dev/null || die "missing $tool; install required packages first"
@@ -77,31 +96,14 @@ command -v python3 >/dev/null || die 'python3 is required'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' || die 'Python 3.8+ is required'
 
 temporary=$(mktemp -d)
-if [[ -z "$source_dir" ]]; then
-    command -v git >/dev/null || die 'git is required to download; alternatively use --source-dir'
-    source_dir="$temporary/source"
-    git init -q "$source_dir"
-    git -C "$source_dir" remote add origin "$repository"
-    GIT_TERMINAL_PROMPT=0 git -c http.sslVerify=true -C "$source_dir" fetch --depth=1 origin "$ref"
-    git -C "$source_dir" checkout -q --detach FETCH_HEAD
-    printf 'Downloaded commit: '
-    git -C "$source_dir" rev-parse HEAD
-else
-    source_dir=$(cd -- "$source_dir" && pwd -P)
-fi
-
-files=(lan_diag.py wire_test.py service_runner.py targets.example.json service_config.example.json README.md VALIDATION.md)
-for name in "${files[@]}" lan-diag.service; do
-    [[ -f "$source_dir/$name" && ! -L "$source_dir/$name" ]] || die "missing or symlink source file: $name"
-done
-
 base="$destdir/opt/lan-diag"
 config_dir="$destdir/etc/lan-diag"
 unit_dir="$destdir/etc/systemd/system"
 logs="$destdir/var/log/lan-diag"
+cache_root="$destdir/var/cache/lan-diag"
 # Check every parent, including a staging root's etc/opt/var components, so a
 # symlink cannot redirect a staging install onto the host filesystem.
-python3 - "$base" "$config_dir" "$unit_dir" "$logs" <<'PY'
+python3 - "$base" "$config_dir" "$unit_dir" "$logs" "$cache_root" <<'PY'
 from pathlib import Path
 import sys
 for name in sys.argv[1:]:
@@ -110,6 +112,94 @@ for name in sys.argv[1:]:
         if part.is_symlink():
             sys.exit('ERROR: refusing symlink installation path: ' + str(part))
 PY
+if [[ -z "$source_dir" ]]; then
+    install -d -m 0700 "$cache_root"
+    cache_key=$(python3 - "$repository" "$ref" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256((sys.argv[1] + '\0' + sys.argv[2]).encode()).hexdigest())
+PY
+)
+    cache_entry="$cache_root/$cache_key"
+    [[ ! -L "$cache_entry" && ! -L "$cache_entry.lock" ]] || die 'refusing symlink download cache'
+    command -v flock >/dev/null || die 'flock (util-linux) is required for the download cache'
+    exec {cache_lock}>"$cache_entry.lock"
+    flock "$cache_lock"
+    # A completed cache is identified by ref, repository and every required
+    # file's hash. Partial, empty or modified files are never executed as-is.
+    if ((refresh == 0)) && python3 - "$cache_entry" "$repository" "$ref" "${download_files[@]}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+try:
+    marker = root / 'download.json'
+    if marker.is_symlink() or not root.is_dir():
+        sys.exit(1)
+    data = json.loads(marker.read_text())
+    if (data.get('repository'), data.get('ref')) != (sys.argv[2], sys.argv[3]):
+        sys.exit(1)
+    if set(data['files']) != set(sys.argv[4:]):
+        sys.exit(1)
+    source = root / 'source'
+    if source.is_symlink() or not source.is_dir():
+        sys.exit(1)
+    for name in sys.argv[4:]:
+        path = source / name
+        if path.is_symlink() or not path.is_file() or not path.stat().st_size:
+            sys.exit(1)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != data['files'][name]:
+            sys.exit(1)
+except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    sys.exit(1)
+PY
+    then
+        printf 'SKIP download: verified source already exists for ref %s\n' "$ref"
+    else
+        command -v git >/dev/null || die 'git is required to download; alternatively use --source-dir'
+        printf 'Downloading source for ref %s (missing/incomplete cache or --refresh).\n' "$ref"
+        cache_stage=$(mktemp -d "$cache_root/.download.XXXXXXXX")
+        source_dir="$cache_stage/source"
+        git init -q "$source_dir"
+        git -C "$source_dir" remote add origin "$repository"
+        GIT_TERMINAL_PROMPT=0 git -c http.sslVerify=true -C "$source_dir" fetch --depth=1 origin "$ref"
+        git -C "$source_dir" checkout -q --detach FETCH_HEAD
+        commit=$(git -C "$source_dir" rev-parse HEAD)
+        printf 'Downloaded commit: %s\n' "$commit"
+        python3 - "$cache_stage" "$repository" "$ref" "$commit" "${download_files[@]}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+files = {}
+for name in sys.argv[5:]:
+    path = root / 'source' / name
+    if path.is_symlink() or not path.is_file() or not path.stat().st_size:
+        sys.exit('ERROR: missing, empty or symlink download file: ' + name)
+    files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+(root / 'download.json').write_text(json.dumps({
+    'repository': sys.argv[2], 'ref': sys.argv[3], 'commit': sys.argv[4], 'files': files
+}))
+PY
+        if [[ -e "$cache_entry" ]]; then
+            previous_cache=$(mktemp -d "$cache_root/.previous.XXXXXXXX")
+            mv -- "$cache_entry" "$previous_cache/source-cache"
+            printf 'Previous cache preserved: %s\n' "$previous_cache"
+        fi
+        mv -- "$cache_stage" "$cache_entry"
+        cache_stage=''
+    fi
+    source_dir="$cache_entry/source"
+else
+    source_dir=$(cd -- "$source_dir" && pwd -P)
+    printf 'SKIP download: using local source %s\n' "$source_dir"
+fi
+for name in "${download_files[@]}"; do
+    [[ -s "$source_dir/$name" && -f "$source_dir/$name" && ! -L "$source_dir/$name" ]] || die "missing, empty or symlink source file: $name"
+done
+
 for path in "$base" "$config_dir" "$unit_dir" "$logs" "$base/releases" "$base/backups"; do
     [[ ! -L "$path" ]] || die "refusing symlink installation directory: $path"
 done

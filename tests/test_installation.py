@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -186,6 +187,114 @@ class InstallerTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("symlink installation path", result.stderr)
             self.assertEqual(list(external.iterdir()), [])
+
+
+class DownloadCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.remote = self.root / "source-repository"
+        self.remote.mkdir()
+        for name in ("lan_diag.py", "wire_test.py", "service_runner.py", "targets.example.json",
+                     "service_config.example.json", "README.md", "VALIDATION.md", "lan-diag.service"):
+            shutil.copyfile(ROOT / name, self.remote / name)
+        self.git = shutil.which("git")
+        self.run_git("init", "-q")
+        self.run_git("symbolic-ref", "HEAD", "refs/heads/main")
+        self.run_git("add", ".")
+        self.run_git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Fixture source")
+        self.calls = self.root / "fetch-calls"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        wrapper = self.bin / "git"
+        wrapper.write_text("#!" + sys.executable + "\n" + '''import os, subprocess, sys
+args = sys.argv[1:]
+if 'fetch' in args:
+    with open(os.environ['TEST_FETCH_CALLS'], 'a') as stream:
+        stream.write('fetch\\n')
+    if os.environ.get('TEST_DENY_FETCH') == '1':
+        sys.exit(97)
+replacement = 'url.' + os.environ['TEST_LOCAL_REPOSITORY'] + '.insteadOf=https://github.com/soriel1004/linux-test.git'
+sys.exit(subprocess.call([os.environ['TEST_REAL_GIT'], '-c', replacement, *args]))
+''')
+        wrapper.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                        TEST_REAL_GIT=self.git, TEST_LOCAL_REPOSITORY=str(self.remote),
+                        TEST_FETCH_CALLS=str(self.calls))
+        self.dest = self.root / "installed"
+
+    def run_git(self, *args):
+        subprocess.run([self.git, "-C", str(self.remote), *args], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def install(self, *args, deny_fetch=False):
+        environment = dict(self.env, TEST_DENY_FETCH="1" if deny_fetch else "0")
+        return subprocess.run(["bash", str(ROOT / "install.sh"), "--destdir", str(self.dest), *args],
+                              env=environment, capture_output=True, text=True, timeout=30)
+
+    def source_cache(self):
+        return next((self.dest / "var/cache/lan-diag").glob("*/download.json")).parent
+
+    def test_download_once_then_reinstall_without_any_fetch(self):
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.install(deny_fetch=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("SKIP download: verified source already exists", second.stdout)
+        self.assertEqual(self.calls.read_text().splitlines(), ["fetch"])
+
+    def test_missing_empty_modified_file_or_broken_manifest_is_downloaded_again(self):
+        self.assertEqual(self.install().returncode, 0)
+        actions = (
+            lambda cache: (cache / "source/lan_diag.py").unlink(),
+            lambda cache: (cache / "source/lan_diag.py").write_text(""),
+            lambda cache: (cache / "source/lan_diag.py").write_text("print('unexpected change')\n"),
+            lambda cache: (cache / "download.json").write_text("partial"),
+        )
+        for mutate in actions:
+            with self.subTest(mutation=mutate):
+                mutate(self.source_cache())
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Downloading source", result.stdout)
+                self.assertEqual((self.source_cache() / "source/lan_diag.py").read_bytes(),
+                                 (self.remote / "lan_diag.py").read_bytes())
+        self.assertEqual(len(self.calls.read_text().splitlines()), 5)
+
+    def test_cache_does_not_check_remote_tip_until_explicit_refresh(self):
+        self.assertEqual(self.install().returncode, 0)
+        old = (self.dest / "opt/lan-diag/current").resolve()
+        (self.remote / "README.md").write_text("Updated source\n")
+        self.run_git("add", "README.md")
+        self.run_git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "New version")
+        cached = self.install(deny_fetch=True)
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertEqual((self.dest / "opt/lan-diag/current").resolve(), old)
+        refreshed = self.install("--refresh")
+        self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
+        self.assertNotEqual((self.dest / "opt/lan-diag/current").resolve(), old)
+        self.assertEqual((self.dest / "opt/lan-diag/current/README.md").read_text(), "Updated source\n")
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_failed_refresh_preserves_previous_cache_for_offline_reuse(self):
+        self.assertEqual(self.install().returncode, 0)
+        marker = (self.source_cache() / "download.json").read_bytes()
+        failed = self.install("--refresh", deny_fetch=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual((self.source_cache() / "download.json").read_bytes(), marker)
+        self.assertEqual(self.install(deny_fetch=True).returncode, 0)
+        self.assertFalse(list((self.dest / "var/cache/lan-diag").glob(".download.*")))
+
+    def test_different_refs_do_not_share_download_cache(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.run_git("tag", "inspection-v1")
+        other = self.install("--ref", "inspection-v1")
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertEqual(len(list((self.dest / "var/cache/lan-diag").glob("*/download.json"))), 2)
+        cached = self.install("--ref", "inspection-v1", deny_fetch=True)
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
 
 
 if __name__ == "__main__":

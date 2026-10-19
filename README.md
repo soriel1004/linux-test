@@ -16,16 +16,23 @@
 **Ubuntu 20.04 이상, Python 3.8 이상, systemd를 사용하는 실제 장비**에서 아래 명령을 실행하세요. 인터넷과 관리자 권한이 필요합니다. 카메라나 케이블 없이도 설치하고 기록을 시작할 수 있습니다.
 
 ```bash
-sudo apt-get update && sudo apt-get install -y ca-certificates curl
-curl --fail --location --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/soriel1004/linux-test/main/install.sh \
-  -o install-lan-diag.sh && sudo bash install-lan-diag.sh
+if [ -f install-lan-diag.sh ] && [ -s install-lan-diag.sh ] && [ ! -L install-lan-diag.sh ]; then
+  printf 'SKIP: install-lan-diag.sh already exists\n'
+else
+  if ! command -v curl >/dev/null; then
+    sudo apt-get update && sudo apt-get install -y ca-certificates curl
+  fi &&
+  installer_tmp=$(mktemp ./install-lan-diag.XXXXXXXX) &&
+  curl --fail --location --proto '=https' --tlsv1.2 \
+    https://raw.githubusercontent.com/soriel1004/linux-test/main/install.sh \
+    -o "$installer_tmp" && mv -fT -- "$installer_tmp" install-lan-diag.sh
+fi && sudo bash install-lan-diag.sh
 ```
 
 설치 스크립트는 다음 작업을 수행합니다.
 
-1. Python·Git·iproute2·ethtool·ping 등 필요한 패키지를 서명 검증이 유지되는 APT로 설치합니다.
-2. GitHub의 `main` 소스를 HTTPS로 내려받아 `/opt/lan-diag/releases/`에 설치합니다. 내려받은 커밋을 화면에 표시하고 실행 버전은 `/opt/lan-diag/current`로 연결합니다.
+1. Python·Git·iproute2·ethtool·ping 등 필요한 패키지 중 설치되지 않은 것만 서명 검증이 유지되는 APT로 설치합니다. 모두 설치되어 있으면 APT 업데이트·다운로드를 건너뜁니다.
+2. GitHub 소스는 `/var/cache/lan-diag`에 보관하고 같은 저장소·ref의 파일이 모두 있으며 해시 검증에 통과하면 다운로드를 건너뜁니다. 처음 설치하거나 파일이 누락·비어 있음·변경됨·불완전한 상태이면 다시 다운로드합니다. 검증된 소스는 `/opt/lan-diag/releases/`에 설치하고 실행 버전은 `/opt/lan-diag/current`로 연결합니다.
 3. `/etc/lan-diag/config.json`에 기본 설정을 만듭니다. 재설치하면 기존 설정과 로그를 보존하며, 덮어쓸 서비스 유닛이 수정되어 있으면 백업합니다.
 4. `lan-diag.service`를 등록·활성화하고 **즉시 기록을 시작**합니다. 이후 재부팅 때도 자동으로 시작하고, 비정상 종료되면 systemd가 재시작합니다.
 5. 최대 180초 동안 새 샘플이 실제 기록되는지 확인합니다. 서비스 등록만 성공하고 기록이 안 되는 경우에는 설치 성공으로 표시하지 않습니다.
@@ -61,7 +68,18 @@ sudo systemctl disable --now lan-diag.service
 
 기본 설정은 `service_config.example.json`에 있습니다. `interfaces: []`는 서비스 시작 시 물리 Ethernet 포트를 탐지한다는 뜻입니다. 특정 포트만 기록하려면 실제 이름을 배열로 지정하세요. 지정 포트가 부팅 시 아직 없으면 준비될 때까지 기다립니다. 실행 중 새로 추가한 NIC를 포함하려면 서비스를 재시작합니다. `interval_seconds`, `log_mb`, `backups`, `nic_detail_interval_seconds`, `max_sessions`, `max_total_mb`를 조절할 수 있습니다. 기록을 계속하기 위해 총 용량은 최소한 한 세션의 로그 링 용량보다 5 MiB 커야 합니다.
 
-프로그램 업데이트는 같은 설치 명령을 다시 실행하면 됩니다. 특정 Git 커밋으로 고정하려면 `sudo bash install-lan-diag.sh --ref 전체커밋SHA`를 사용하세요. 설치 시 해당 서비스가 재시작되어 새 세션을 만들며 기존 설정은 유지됩니다. 이전 소스 버전은 `/opt/lan-diag/releases/`에 보존됩니다. 직접 변경한 systemd 설정은 유닛을 수정하는 대신 `sudo systemctl edit lan-diag.service`로 drop-in을 만드는 방식을 권장합니다.
+같은 설치 명령을 다시 실행하면 기존 다운로드를 재사용합니다. **`main`이 GitHub에서 갱신되어도 기본 실행은 최신 커밋을 조회하지 않습니다.** 최신 소스를 의도적으로 다시 받으려면 `sudo bash install-lan-diag.sh --refresh`를 사용하세요. 다른 커밋·태그는 별도 캐시에 저장되며 특정 커밋으로 고정하려면 `sudo bash install-lan-diag.sh --ref 전체커밋SHA`를 사용합니다. 다운로드 실패 시 기존 캐시는 유지하며, 새 다운로드로 교체한 이전 캐시는 `/var/cache/lan-diag/.previous.…`에 보존합니다. 필요 없어진 이전 캐시는 관리자가 정리할 수 있습니다.
+
+위 안내 명령은 설치 스크립트 자체도 이미 있으면 다운로드를 건너뜁니다. **예전에 받은 설치 스크립트에 이번 기능이 없다면 한 번은 최신 설치 스크립트로 교체**해야 합니다. 설치 스크립트를 업데이트할 때는 아래 명령을 사용하고, 필요한 경우 이어서 `sudo bash install-lan-diag.sh --refresh`를 실행하세요.
+
+```bash
+installer_tmp=$(mktemp ./install-lan-diag.XXXXXXXX) &&
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/soriel1004/linux-test/main/install.sh \
+  -o "$installer_tmp" && mv -fT -- "$installer_tmp" install-lan-diag.sh
+```
+
+설치 시 서비스가 재시작되어 새 세션을 만들며 기존 설정은 유지됩니다. 이전 소스 버전은 `/opt/lan-diag/releases/`에 보존됩니다. 직접 변경한 systemd 설정은 유닛을 수정하는 대신 `sudo systemctl edit lan-diag.service`로 drop-in을 만드는 방식을 권장합니다.
 
 인터넷이 없는 장비에서는 저장소 파일 전체를 USB 등으로 옮긴 뒤, 필요한 패키지가 이미 설치된 경우 다음처럼 설치할 수 있습니다.
 
