@@ -198,7 +198,7 @@ def execute(args):
     if not args.run:
         print('Preflight only. Confirm isolated equipment and a direct cable, then add --run.')
         return 0
-    blocked = guard(lab.metrics(args.interfaces), 85, 70)
+    blocked = guard(lab.metrics(args.interfaces), lab.CPU_LIMIT, lab.NVME_LIMIT)
     if blocked:
         raise ValueError('test not started: ' + json.dumps(blocked))
     stop, user_stop = threading.Event(), threading.Event()
@@ -211,7 +211,7 @@ def execute(args):
     try:
         recorder.open()
         snapshot, _ = recorder.sample()
-        if guard(snapshot, 85, 70):
+        if guard(snapshot, lab.CPU_LIMIT, lab.NVME_LIMIT):
             raise ValueError('temperature guard blocked test after inventory')
         session = uuid.uuid4().bytes
         for n in (0, 1):
@@ -231,7 +231,7 @@ def execute(args):
             count += len(events)
             recorder.log.write('wire_sample', directions=[c.snapshot() for c in channels])
             elapsed = time.monotonic() - started
-            blocked = guard(snapshot, 85, 70)
+            blocked = guard(snapshot, lab.CPU_LIMIT, lab.NVME_LIMIT)
             if blocked:
                 recorder.log.write('event', event='load_guard', details=blocked)
                 reason = 'temperature_or_memory_guard'

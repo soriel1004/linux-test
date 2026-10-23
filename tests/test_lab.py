@@ -35,13 +35,14 @@ class GuardTests(unittest.TestCase):
         sample['temperatures'] = sample['temperatures'][:1]
         self.assertEqual(load.guard(sample, 85, 70)['thermal']['missing'], ['nvme'])
 
-    def test_temperature_limit_and_vendor_critical_margin(self):
+    def test_temperature_limit_and_vendor_critical_ceiling(self):
         sample = safe_snapshot()
         self.assertIsNone(load.guard(sample, 85, 70))
         sample['temperatures'][1]['celsius'] = 70
         self.assertIn('thermal', load.guard(sample, 85, 70))
         sample['temperatures'][1].update(celsius=65, critical_celsius=68)
-        self.assertEqual(load.guard(sample, 85, 70)['thermal']['hot'][0]['stop_limit_celsius'], 63)
+        sample['temperatures'][1]['celsius'] = 68
+        self.assertEqual(load.guard(sample, 85, 70)['thermal']['hot'][0]['stop_limit_celsius'], 68)
 
     def test_memory_and_nvme_warning_stop(self):
         sample = safe_snapshot()

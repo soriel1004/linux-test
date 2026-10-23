@@ -20,6 +20,39 @@ import time
 NET_COUNTERS = ('rx_bytes', 'tx_bytes', 'rx_packets', 'tx_packets', 'rx_errors',
                 'tx_errors', 'rx_dropped', 'tx_dropped', 'rx_crc_errors',
                 'rx_missed_errors', 'rx_fifo_errors', 'tx_carrier_errors')
+CPU_LIMIT = 100
+NVME_LIMIT = 90
+NVME_SENSOR_MAP = {}
+NVME_ROLES = ('composite', 'controller', 'nand', 'unspecified')
+
+
+def model_profile(model):
+    text = (model or '').upper()
+    if 'G440E250G' in text:
+        return 'GIGABYTE G440E250G'
+    if 'EM280256GMN58-PE33TAS' in text:
+        return 'EM280256GMN58-PE33TAS (PHISON/OEM)'
+    return None
+
+
+def sensor_role(label):
+    text = label.lower()
+    if 'controller' in text or '컨트롤러' in text:
+        return 'controller'
+    if 'composite' in text or '종합' in text or 'overall' in text:
+        return 'composite'
+    if 'nand' in text or 'flash' in text or 'media' in text:
+        return 'nand'
+    return 'unspecified'
+
+
+def temperature_summary(sensors):
+    result = {}
+    for key in ('cpu', 'nvme', *(('nvme_' + r) for r in NVME_ROLES)):
+        values = [s['celsius'] for s in sensors if s['kind'] == key or
+                  (s['kind'] == 'nvme' and key == 'nvme_' + s.get('role', 'unspecified'))]
+        result[key] = max(values) if values else None
+    return result
 
 
 def now():
@@ -65,9 +98,22 @@ def temperatures(root=Path('/sys/class/hwmon'), zones=Path('/sys/class/thermal')
                 continue
             prefix = path.name[:-6]
             critical = number(hwmon / (prefix + '_crit'))
-            result.append({'id': str(path), 'name': name,
-                           'label': read(hwmon / (prefix + '_label')) or prefix,
+            label = read(hwmon / (prefix + '_label')) or prefix
+            device = (hwmon / 'device').resolve()
+            model = read(device / 'model') if kind == 'nvme' else None
+            serial = read(device / 'serial') if kind == 'nvme' else None
+            sensor_key = '|'.join((model or str(device), serial or '', prefix))
+            role = sensor_role(label) if kind == 'nvme' else None
+            mapped = NVME_SENSOR_MAP.get(sensor_key, {})
+            source = 'driver_label' if role != 'unspecified' else 'unconfirmed'
+            if kind == 'nvme' and mapped.get('role') in NVME_ROLES and mapped.get('evidence'):
+                role, source = mapped['role'], 'user_mapping'
+            result.append({'id': str(path), 'name': name, 'label': label,
                            'kind': kind, 'celsius': value / 1000,
+                           'role': role, 'role_source': source, 'sensor_key': sensor_key,
+                           'model': model, 'serial': serial, 'device': str(device),
+                           'model_profile': model_profile(model),
+                           'role_evidence': mapped.get('evidence') if source == 'user_mapping' else None,
                            'critical_celsius': critical / 1000 if critical else None})
     for zone in sorted(zones.glob('thermal_zone*')):
         value, name = number(zone / 'temp'), read(zone / 'type') or zone.name
@@ -78,7 +124,7 @@ def temperatures(root=Path('/sys/class/hwmon'), zones=Path('/sys/class/thermal')
     return result
 
 
-def thermal_status(sensors, cpu_limit=85, nvme_limit=70):
+def thermal_status(sensors, cpu_limit=CPU_LIMIT, nvme_limit=NVME_LIMIT):
     missing = [kind for kind in ('cpu', 'nvme') if not any(s['kind'] == kind for s in sensors)]
     hot = []
     for sensor in sensors:
@@ -86,7 +132,7 @@ def thermal_status(sensors, cpu_limit=85, nvme_limit=70):
             continue
         limit = cpu_limit if sensor['kind'] == 'cpu' else nvme_limit
         if sensor.get('critical_celsius') is not None:
-            limit = min(limit, sensor['critical_celsius'] - 5)
+            limit = min(limit, sensor['critical_celsius'])
         if sensor['celsius'] >= limit:
             hot.append(dict(sensor, stop_limit_celsius=limit))
     return {'safe_to_load': not missing and not hot, 'missing': missing, 'hot': hot}
@@ -403,7 +449,8 @@ def report(directory):
     clue_pattern = re.compile(r'nvme.*(timeout|reset|abort|error)|NETDEV WATCHDOG|AER:|PCIe Bus Error|thermal.*(critical|thrott)|Out of memory|oom-kill|link.*(down|lost)|USB disconnect|reset.*USB', re.I)
     disk_await_peak, min_memory, top_core_peak = None, None, None
     nic_totals = {}
-    peaks = {'cpu': None, 'nvme': None}
+    peaks = {key: None for key in temperature_summary([])}
+    nvme_sensors = {}
     first, last = None, None
     stride = 1
     for path in sorted(files, key=order, reverse=True):
@@ -420,8 +467,10 @@ def report(directory):
                         kernel_clues.append(record)
                     if record['kind'] == 'sample':
                         data = record['data']
-                        temps = {kind: max((s['celsius'] for s in data['temperatures'] if s['kind'] == kind), default=None)
-                                 for kind in peaks}
+                        temps = temperature_summary(data['temperatures'])
+                        for sensor in data['temperatures']:
+                            if sensor['kind'] == 'nvme':
+                                nvme_sensors[sensor.get('sensor_key', sensor.get('id', sensor.get('label', 'unknown')))] = sensor
                         for kind, value in temps.items():
                             if value is not None:
                                 peaks[kind] = max(peaks[kind], value) if peaks[kind] is not None else value
@@ -452,6 +501,7 @@ def report(directory):
     summary = {'samples_retained': samples, 'malformed_lines': malformed, 'first_retained_time': first,
                'last_retained_time': last, 'peak_celsius': peaks, 'event_counts': dict(counts),
                'latest_events': list(events), 'temperature_points': points,
+               'nvme_sensor_details': list(nvme_sensors.values()),
                'peak_disk_interval_average_await_ms': disk_await_peak,
                'min_available_memory_mib': min_memory / 1024 ** 2 if min_memory is not None else None,
                'peak_single_core_busy_percent': top_core_peak,
@@ -463,7 +513,9 @@ def report(directory):
     chart = []
     start_mono = points[0]['monotonic'] if points else 0
     span = max(0.001, points[-1]['monotonic'] - start_mono) if points else 1
-    for kind, color in (('cpu', '#dc2626'), ('nvme', '#2563eb')):
+    for kind, color in (('cpu', '#dc2626'), ('nvme_composite', '#2563eb'),
+                        ('nvme_controller', '#ea580c'), ('nvme_nand', '#16a34a'),
+                        ('nvme_unspecified', '#888888')):
         segments, current = [], []
         for index, point in enumerate(points):
             if point[kind] is None:
@@ -482,7 +534,7 @@ def report(directory):
                 chart.append('<line x1="%0.1f" x2="%0.1f" y1="20" y2="260" stroke="#888" stroke-dasharray="3"/>' % (x, x))
     body = ('<!doctype html><html lang="ko"><meta charset="utf-8"><title>센서 장비 진단</title>'
             '<style>body{font:16px sans-serif;max-width:1100px;margin:30px auto;padding:12px}pre{white-space:pre-wrap;overflow-wrap:anywhere}td{vertical-align:top;border-bottom:1px solid #ddd;padding:8px}svg{width:100%;background:#fafafa}</style>'
-            '<h1>무센서 장비 진단 기록</h1><p>관측 시각은 UTC. CPU 빨강 / NVMe 파랑. 회색 세로선: NIC·NVMe·PCIe 이벤트. 선이 없는 구간은 온도 수집 불가.</p>'
+            '<h1>무센서 장비 진단 기록</h1><p>관측 시각은 UTC. CPU 빨강 / NVMe 종합 파랑 / 컨트롤러 주황 / NAND 초록 / 미확인 센서 회색. 회색 세로선: NIC·NVMe·PCIe 이벤트. 번호만 있는 센서는 컨트롤러로 단정하지 않습니다.</p>'
             '<p>온도와 오류가 함께 나타나도 원인 확정은 아닙니다. 보존된 구간만 분석하며 실제 카메라·게임 정상 여부를 판정하지 않습니다.</p>'
             '<pre>' + html.escape(json.dumps({k: v for k, v in summary.items() if k not in ('latest_events', 'temperature_points', 'kernel_keyword_matches')}, ensure_ascii=False, indent=2)) + '</pre>'
             '<svg viewBox="0 0 1000 300" role="img" aria-label="CPU와 NVMe 온도 추이">'

@@ -237,8 +237,8 @@ def main(argv=None):
     parser.add_argument('--disk-size-mb', type=int, default=256)
     parser.add_argument('--disk-mib', type=float, default=8, help='write MiB/s; default 8')
     parser.add_argument('--duration', type=int, default=600)
-    parser.add_argument('--cpu-limit', type=float, default=85)
-    parser.add_argument('--nvme-limit', type=float, default=70)
+    parser.add_argument('--cpu-limit', type=float, default=lab.CPU_LIMIT)
+    parser.add_argument('--nvme-limit', type=float, default=lab.NVME_LIMIT)
     parser.add_argument('--interfaces', nargs='+')
     parser.add_argument('--output', default='./results')
     args = parser.parse_args(argv)
@@ -247,7 +247,7 @@ def main(argv=None):
     if (not 10 <= args.duration <= 3600 or not 1 <= args.workers <= min(32, os.cpu_count() or 1) or
             not 10 <= args.cpu_load <= 90 or not 0 <= args.memory_mb <= 2048 or
             not 64 <= args.disk_size_mb <= 1024 or not 0.1 <= args.disk_mib <= 100 or
-            not 50 <= args.cpu_limit <= 95 or not 40 <= args.nvme_limit <= 80):
+            not 50 <= args.cpu_limit <= 100 or not 40 <= args.nvme_limit <= 90):
         parser.error('invalid load/duration/temperature limits; see --help')
     return execute(args)
 

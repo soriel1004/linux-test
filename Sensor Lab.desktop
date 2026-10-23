@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Sensor Lab
+Name[ko]=센서 장비 자동 검사
+Comment=Install missing packages and start thermal and LAN diagnostics
+Comment[ko]=필요한 패키지 설치 후 발열·NVMe·LAN 검사 시작
+Exec=/usr/bin/python3 -c "import os,sys,urllib.parse;p=sys.argv[1];p=urllib.parse.unquote(urllib.parse.urlparse(p).path) if p.startswith('file:') else p;d=os.path.dirname(p);s=os.path.join(d,'start.sh');s=s if os.path.isfile(s) else os.path.join(d,'sensor-lab','start.sh');os.execv('/bin/bash',['bash',s])" %k
+Icon=utilities-system-monitor
+Terminal=true
+Categories=System;Monitor;
+StartupNotify=false
