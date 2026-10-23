@@ -26,6 +26,8 @@ Python 3.8 이상과 Ubuntu 20.04 이상에서 동작하도록 작성했습니�
 
 ### 실행 아이콘으로 시작하기
 
+[v1.1.0 ZIP 바로 다운로드](https://raw.githubusercontent.com/soriel1004/linux-test/main/downloads/sensor-lab_v1.1.0.zip)
+
 배포용 `sensor-lab_v1.1.0.zip`을 **우분투 바탕화면에 압축 해제**하면 `Sensor Lab_v1.1.0.desktop` 아이콘과 `sensor-lab` 폴더가 생깁니다. 두 항목은 같은 위치에 둡니다. ZIP/TAR 배포 파일과 바깥 실행 아이콘에 버전을 붙이고 화면에도 표시합니다. 내부 Python 모듈·스크립트 이름은 실행 경로 호환을 위해 유지합니다. 아이콘을 실행하면 다음 순서로 진행합니다.
 
 1. 필요한 패키지가 설치되어 있는지 확인하고, 빠진 패키지만 내려받아 설치합니다. 모두 있으면 APT 다운로드를 생략합니다.

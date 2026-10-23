@@ -17,6 +17,8 @@ def build(output):
     files = subprocess.check_output(['git', 'ls-files', '-z'], cwd=str(root)).decode().split('\0')
     entries = []
     for name in filter(None, files):
+        if name.startswith('downloads/'):
+            continue
         source = root / name
         mode = 0o755 if source.stat().st_mode & 0o111 else 0o644
         entries.append(('sensor-lab/' + name, source.read_bytes(), mode))
