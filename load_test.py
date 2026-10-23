@@ -14,6 +14,7 @@ import threading
 import time
 
 import sensor_lab as lab
+from run_config import MAX_DURATION_SECONDS
 
 
 def guard(snapshot, cpu_limit, nvme_limit):
@@ -244,7 +245,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not (args.cpu or args.memory_mb or args.disk_dir):
         parser.error('select --cpu, --memory-mb and/or --disk-dir')
-    if (not 10 <= args.duration <= 3600 or not 1 <= args.workers <= min(32, os.cpu_count() or 1) or
+    if (not 10 <= args.duration <= MAX_DURATION_SECONDS or not 1 <= args.workers <= min(32, os.cpu_count() or 1) or
             not 10 <= args.cpu_load <= 90 or not 0 <= args.memory_mb <= 2048 or
             not 64 <= args.disk_size_mb <= 1024 or not 0.1 <= args.disk_mib <= 100 or
             not 50 <= args.cpu_limit <= 100 or not 40 <= args.nvme_limit <= 90):

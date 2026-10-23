@@ -15,6 +15,7 @@ import zlib
 
 import sensor_lab as lab
 from load_test import guard
+from run_config import MAX_DURATION_SECONDS
 
 PROTOCOL = 0x88B5
 HEADER = struct.Struct('!8s16sBQ')
@@ -271,7 +272,7 @@ def main(argv=None):
     parser.add_argument('--output', default='./results')
     parser.add_argument('--run', action='store_true')
     args = parser.parse_args(argv)
-    if not 5 <= args.duration <= 3600 or not 0.1 <= args.mbps <= 9000 or not 128 <= args.payload_size <= 1500:
+    if not 5 <= args.duration <= MAX_DURATION_SECONDS or not 0.1 <= args.mbps <= 9000 or not 128 <= args.payload_size <= 1500:
         parser.error('invalid duration, rate or payload size')
     return execute(args)
 

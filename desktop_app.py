@@ -16,13 +16,14 @@ import webbrowser
 
 import gui_common
 import sensor_lab as lab
+from run_config import DURATION_OPTIONS, VERSION, selected_duration, stage_durations
 
 ROLE_NAMES = {'composite': '종합 / 일반 (Composite)', 'controller': '컨트롤러',
               'nand': 'NAND / 미디어', 'unspecified': '역할 미확인'}
 
 
 class App:
-    def __init__(self, root, output=None, auto=True):
+    def __init__(self, root, output=None):
         self.root = root
         self.output = Path(output or Path.home() / 'SensorLab' / 'results').resolve()
         self.settings = self.output.parent / 'settings' / 'temperature-map.json'
@@ -38,13 +39,13 @@ class App:
         self.process, self.session, self.console = None, None, None
         self.offset, self.partial, self.reports, self.rows = 0, '', [], {}
         self.closing, self.finished = False, False
-        root.title('센서 장비 검사 — CPU · NVMe · LAN')
+        root.title('센서 장비 검사 v' + VERSION + ' — CPU · NVMe · LAN')
         root.geometry('1100x820')
         root.minsize(900, 680)
         root.protocol('WM_DELETE_WINDOW', self.close)
         frame = ttk.Frame(root, padding=16)
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='센서 장비 자동 검사', font=('', 20, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text='센서 장비 자동 검사 v' + VERSION, font=('', 20, 'bold')).pack(anchor='w')
         ttk.Label(frame, text='중단 설정: CPU 100°C / NVMe 모든 센서 90°C · 장치가 보고한 더 낮은 critical 온도 우선').pack(anchor='w', pady=(4, 8))
         self.cards = {}
         cards = ttk.Frame(frame)
@@ -66,9 +67,15 @@ class App:
         ttk.Button(frame, text='선택 NVMe 센서 역할 지정…', command=self.map_sensor).pack(anchor='w', pady=5)
         options = ttk.Frame(frame)
         options.pack(fill='x', pady=6)
-        ttk.Label(options, text='부하 단계별 시간(분)').pack(side='left')
-        self.minutes = tk.StringVar(value='5')
-        ttk.Spinbox(options, from_=1, to=60, textvariable=self.minutes, width=5).pack(side='left', padx=6)
+        ttk.Label(options, text='검사 전체 시간').pack(side='left')
+        self.duration_choice = tk.StringVar(value=DURATION_OPTIONS[0])
+        self.duration_box = ttk.Combobox(options, textvariable=self.duration_choice,
+                                         values=DURATION_OPTIONS, state='readonly', width=13)
+        self.duration_box.pack(side='left', padx=6)
+        self.custom_minutes = tk.StringVar(value='240')
+        self.custom_entry = ttk.Entry(options, textvariable=self.custom_minutes, width=7, state='disabled')
+        self.custom_entry.pack(side='left')
+        ttk.Label(options, text='분 (직접 입력)').pack(side='left', padx=4)
         ttk.Label(options, text='NVMe 시험 디렉터리').pack(side='left', padx=(15, 4))
         self.disk = tk.StringVar(value='/var/tmp')
         ttk.Entry(options, textvariable=self.disk, width=25).pack(side='left', fill='x', expand=True)
@@ -83,8 +90,9 @@ class App:
         self.stop_button = ttk.Button(buttons, text='검사 중지', command=self.stop, state='disabled')
         self.stop_button.pack(side='right')
         self.description = tk.StringVar()
-        ttk.Label(frame, textvariable=self.description).pack(anchor='w', pady=5)
-        self.minutes.trace_add('write', lambda *_: self.update_description())
+        ttk.Label(frame, textvariable=self.description, wraplength=1000).pack(anchor='w', pady=5)
+        self.duration_choice.trace_add('write', lambda *_: self.update_description())
+        self.custom_minutes.trace_add('write', lambda *_: self.update_description())
         self.update_description()
         network = ttk.LabelFrame(frame, text='직결 케이블 LAN 시험', padding=6)
         network.pack(fill='x', pady=4)
@@ -103,7 +111,7 @@ class App:
         wire_button = ttk.Button(network, text='LAN 시험 시작', command=lambda: self.start('wire'))
         wire_button.pack(side='left', padx=10)
         self.start_buttons.append(wire_button)
-        self.status = tk.StringVar(value='준비 — 자동 검사 시작 대기')
+        self.status = tk.StringVar(value='준비 — 시간을 선택하고 검사 시작을 누르세요.')
         ttk.Label(frame, textvariable=self.status, wraplength=1000, font=('', 11, 'bold')).pack(anchor='w', pady=7)
         self.progress = ttk.Progressbar(frame, mode='indeterminate')
         self.progress.pack(fill='x')
@@ -117,8 +125,6 @@ class App:
         if settings_error:
             self.add_log('센서 설정 읽기 실패: ' + settings_error)
         root.after(400, self.poll)
-        if auto:
-            root.after(800, lambda: self.start('auto'))
 
     def add_log(self, text):
         self.log.configure(state='normal')
@@ -134,19 +140,19 @@ class App:
             self.disk.set(path)
 
     def update_description(self):
+        self.custom_entry.configure(state='normal' if self.duration_choice.get() == '직접 입력' and self.process is None else 'disabled')
         try:
-            minutes = int(self.minutes.get())
-            if not 1 <= minutes <= 60:
-                raise ValueError()
-            self.description.set('자동 순서: 기준 기록 1분 → CPU → RAM 512 MiB → NVMe 파일 I/O (약 %d분, 스냅샷 시간 별도).\nNVMe 요청 쓰기 약 %.1f GiB / 전용 파일 최대 256 MiB. LAN은 케이블 확인 후 별도 실행.' % (1 + minutes * 3, minutes * 60 * 8 / 1024))
-        except ValueError:
-            self.description.set('단계 시간을 1~60분으로 입력하세요. NVMe는 전용 파일만 사용하며 LAN은 별도 실행합니다.')
+            duration = selected_duration(self.duration_choice.get(), self.custom_minutes.get())
+            baseline, cpu, memory, disk = stage_durations('auto', duration)
+            self.description.set('자동 검사 전체 %d분: 기준 %d초 → CPU %d초 → RAM %d초 → NVMe %d초 (준비·보고서 시간 별도).\n개별 검사는 선택 시간 전체 실행. NVMe 요청 쓰기: 자동 약 %.1f GiB / NVMe만 약 %.1f GiB, 파일 최대 256 MiB. LAN은 별도 실행.' % (duration // 60, baseline, cpu, memory, disk, disk * 8 / 1024, duration * 8 / 1024))
+        except ValueError as exc:
+            self.description.set(str(exc))
 
     def start(self, mode):
         if self.process is not None:
             return
         try:
-            data = gui_common.validate_job({'mode': mode, 'duration': int(self.minutes.get()) * 60,
+            data = gui_common.validate_job({'mode': mode, 'duration': selected_duration(self.duration_choice.get(), self.custom_minutes.get()),
                                             'disk_dir': self.disk.get(), 'roles': self.roles,
                                             'interfaces': [self.port_a.get(), self.port_b.get()],
                                             'mbps': float(self.mbps.get()) if mode == 'wire' else 50, 'parent_pid': os.getpid(),
@@ -181,6 +187,8 @@ class App:
         for button in self.start_buttons:
             button.configure(state='disabled')
         self.stop_button.configure(state='normal')
+        self.duration_box.configure(state='disabled')
+        self.custom_entry.configure(state='disabled')
         self.progress.start(10)
 
     def stop(self):
@@ -252,6 +260,8 @@ class App:
                 for button in self.start_buttons:
                     button.configure(state='normal')
                 self.stop_button.configure(state='disabled')
+                self.duration_box.configure(state='readonly')
+                self.update_description()
                 if not self.finished:
                     self.status.set('관리자 승인이 취소되었거나 실패했습니다. 검사를 다시 시작할 수 있습니다.' if code in (126, 127) else
                                     '검사가 시작되지 않았거나 예기치 않게 종료됐습니다. console.log를 확인하세요. (코드 %s)' % code)
@@ -325,11 +335,12 @@ class App:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--no-auto', action='store_true')
+    parser.add_argument('--no-auto', action='store_true', help='호환용 옵션: 기본 실행도 시간 선택 후 시작합니다.')
+    parser.add_argument('--version', action='version', version='v' + VERSION)
     parser.add_argument('--output')
     args = parser.parse_args(argv)
     root = tk.Tk()
-    App(root, args.output, auto=not args.no_auto)
+    App(root, args.output)
     root.mainloop()
 
 

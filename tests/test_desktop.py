@@ -14,6 +14,7 @@ from unittest.mock import patch
 import gui_common
 import gui_worker
 import sensor_lab as lab
+from run_config import DURATION_OPTIONS, MAX_DURATION_SECONDS, selected_duration
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,6 +71,35 @@ class TemperatureTests(unittest.TestCase):
 
 
 class DesktopWorkflowTests(unittest.TestCase):
+    def test_duration_choices_custom_validation_and_exact_total(self):
+        for choice, minutes in zip(DURATION_OPTIONS[:-1], (30, 60, 90, 120, 150, 180)):
+            self.assertEqual(selected_duration(choice), minutes * 60)
+        self.assertEqual(selected_duration('직접 입력', '240'), 14400)
+        for value in ('', 'abc', 'NaN', '240.5', '180', '-1', '10081'):
+            with self.assertRaises(ValueError):
+                selected_duration('직접 입력', value)
+        for duration in (40, 300, 1800, 5400, 10800, 10860, 14400, MAX_DURATION_SECONDS):
+            job = gui_common.validate_job(dict(job_data(), duration=duration))
+            steps = gui_common.stages(job, '/tmp/output')
+            seconds = [int(args[args.index('--duration') + 1]) for _, _, args in steps]
+            self.assertEqual(sum(seconds), duration)
+            self.assertGreaterEqual(min(seconds), 10)
+            self.assertLessEqual(max(seconds[1:]) - min(seconds[1:]), 1)
+        for mode in ('cpu', 'memory', 'disk', 'wire', 'monitor'):
+            data = dict(job_data(mode), duration=14400, interfaces=['enp1s0', 'enp2s0'])
+            args = gui_common.stages(gui_common.validate_job(data), '/tmp/output')[0][2]
+            self.assertEqual(args[args.index('--duration') + 1], '14400')
+
+    def test_long_duration_reaches_cli_backends_without_real_load(self):
+        import load_test
+        import wire_test
+        with patch.object(load_test, 'execute', return_value=0) as run:
+            self.assertEqual(load_test.main(['--cpu', '--duration', '14400']), 0)
+            self.assertEqual(run.call_args[0][0].duration, 14400)
+        with patch.object(wire_test, 'execute', return_value=0) as run:
+            self.assertEqual(wire_test.main(['--interfaces', 'enp1s0', 'enp2s0', '--duration', '14400', '--run']), 0)
+            self.assertEqual(run.call_args[0][0].duration, 14400)
+
     def test_auto_sequence_excludes_unattended_lan_and_keeps_bounded_disk(self):
         job = gui_common.validate_job(job_data())
         steps = gui_common.stages(job, '/tmp/output with spaces')
@@ -81,6 +111,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def test_invalid_jobs_and_unconfirmed_mapping_rejected(self):
         for data in (dict(job_data(), mode='shell'), dict(job_data(), duration=True),
+                     dict(job_data(), duration=MAX_DURATION_SECONDS + 1), dict(job_data(), duration=39),
                      dict(job_data(), disk_dir='relative'),
                      dict(job_data(), roles={'ssd': {'role': 'controller', 'evidence': ''}}),
                      dict(job_data('wire'), interfaces=['lo', 'lo'])):
@@ -150,6 +181,30 @@ install_missing_packages present-a present-b
 
 @unittest.skipUnless(os.environ.get('DISPLAY'), 'GUI test requires a display/Xvfb')
 class TkSmokeTests(unittest.TestCase):
+    def test_custom_time_is_sent_to_worker_and_locked_during_run(self):
+        import tkinter as tk
+        import desktop_app
+        with tempfile.TemporaryDirectory() as tmp:
+            root = tk.Tk()
+            try:
+                app = desktop_app.App(root, tmp)
+                app.duration_choice.set('직접 입력')
+                app.custom_minutes.set('240')
+                with patch.object(desktop_app.os, 'geteuid', return_value=0), patch.object(desktop_app.subprocess, 'Popen'):
+                    app.start('auto')
+                job = json.loads((app.session / 'job.json').read_text())
+                self.assertEqual(job['duration'], 14400)
+                self.assertIn('disabled', app.duration_box.state())
+                self.assertIn('disabled', app.custom_entry.state())
+                app.stop()
+                self.assertTrue((app.session / 'stop').exists())
+                self.assertIn('disabled', app.duration_box.state())
+            finally:
+                if app.console:
+                    app.console.close()
+                app.progress.stop()
+                root.destroy()
+
     def test_window_displays_composite_and_keeps_unmapped_controller_unknown(self):
         try:
             import tkinter as tk
@@ -159,7 +214,7 @@ class TkSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = tk.Tk()
             try:
-                app = desktop_app.App(root, tmp, auto=False)
+                app = desktop_app.App(root, tmp)
                 root.update()
                 sensors = [dict(kind='nvme', celsius=70, role='composite', role_source='driver_label', label='Composite', name='nvme', model='G440E250G', sensor_key='a'),
                            dict(kind='nvme', celsius=85, role='unspecified', role_source='unconfirmed', label='Sensor 1', name='nvme', model='G440E250G', sensor_key='b')]
@@ -168,9 +223,21 @@ class TkSmokeTests(unittest.TestCase):
                 self.assertIn('70.0', app.cards['nvme_composite'].get())
                 self.assertIn('미확인', app.cards['nvme_controller'].get())
                 self.assertEqual(len(app.tree.get_children()), 2)
-                app.minutes.set('10')
-                self.assertIn('31분', app.description.get())
-                self.assertIn('4.7 GiB', app.description.get())
+                self.assertEqual(tuple(app.duration_box['values']), DURATION_OPTIONS)
+                self.assertIn('전체 30분', app.description.get())
+                app.duration_choice.set('3시간')
+                self.assertIn('전체 180분', app.description.get())
+                self.assertIn('disabled', app.custom_entry.state())
+                app.duration_choice.set('직접 입력')
+                app.custom_minutes.set('240')
+                self.assertNotIn('disabled', app.custom_entry.state())
+                self.assertIn('전체 240분', app.description.get())
+                self.assertIn('37.3 GiB', app.description.get())
+                self.assertIn('112.5 GiB', app.description.get())
+                app.custom_minutes.set('180')
+                self.assertIn('181~10080분', app.description.get())
+                self.assertIsNone(app.process)
+                self.assertIn('시간을 선택', app.status.get())
             finally:
                 root.destroy()
 
@@ -180,7 +247,7 @@ class TkSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = tk.Tk()
             try:
-                app = desktop_app.App(root, tmp, auto=False)
+                app = desktop_app.App(root, tmp)
                 app.session = Path(tmp)
                 path = app.session / 'gui-events.jsonl'
                 path.touch()
@@ -195,6 +262,7 @@ class TkSmokeTests(unittest.TestCase):
                 self.assertTrue(app.finished)
                 self.assertIn('관찰 완료', app.status.get())
                 self.assertTrue((app.session / 'index.html').exists())
+                self.assertNotIn('disabled', app.duration_box.state())
             finally:
                 root.destroy()
 

@@ -1,6 +1,7 @@
 """Desktop job validation and stage selection, independent of Tk/display."""
 import os
 from pathlib import Path
+from run_config import MAX_DURATION_SECONDS, stage_durations
 
 MODES = ('auto', 'monitor', 'cpu', 'memory', 'disk', 'wire')
 ROLES = ('composite', 'controller', 'nand', 'unspecified')
@@ -19,9 +20,10 @@ def validate_job(data):
     mode = data.get('mode')
     if mode not in MODES:
         raise ValueError('unknown test mode')
-    duration = data.get('duration', 300)
-    if type(duration) is not int or not 10 <= duration <= 3600:
-        raise ValueError('stage duration must be 10..3600 seconds')
+    duration = data.get('duration', 1800)
+    minimum = 40 if mode == 'auto' else 10
+    if type(duration) is not int or not minimum <= duration <= MAX_DURATION_SECONDS:
+        raise ValueError('total duration must be %d..%d seconds' % (minimum, MAX_DURATION_SECONDS))
     disk_dir = data.get('disk_dir', '/var/tmp')
     if not isinstance(disk_dir, str) or not Path(disk_dir).is_absolute():
         raise ValueError('disk directory must be absolute')
@@ -49,18 +51,17 @@ def validate_job(data):
 
 
 def stages(job, output):
-    duration = str(job['duration'])
     cpu = ('CPU 부하', 'load', ['--cpu', '--workers', str(min(2, os.cpu_count() or 1)), '--cpu-load', '60'])
     memory = ('RAM 512 MiB', 'load', ['--memory-mb', '512'])
     disk = ('NVMe 파일 I/O', 'load', ['--disk-dir', job['disk_dir'], '--disk-mib', '8'])
     by_mode = {'cpu': [cpu], 'memory': [memory], 'disk': [disk],
-               'auto': [('기준 기록 1분', 'monitor', []), cpu, memory, disk],
+               'auto': [('기준 기록', 'monitor', []), cpu, memory, disk],
                'monitor': [('상태 기록', 'monitor', [])],
                'wire': [('LAN 양방향', 'wire', ['--interfaces', *job.get('interfaces', []),
                                                '--mbps', str(job.get('mbps', 50)), '--run'])]}
     result = []
-    for label, kind, args in by_mode[job['mode']]:
-        seconds = '60' if job['mode'] == 'auto' and kind == 'monitor' else duration
+    for (label, kind, args), duration in zip(by_mode[job['mode']], stage_durations(job['mode'], job['duration'])):
+        seconds = str(duration)
         result.append((label, kind, (['monitor'] if kind == 'monitor' else []) + args +
                        ['--duration', seconds, '--output', str(output)]))
     return result
