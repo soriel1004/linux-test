@@ -1,8 +1,0 @@
-{
-  "targets": [
-    {"name": "spin", "interface": "enp1s0", "ip": "192.168.10.10"},
-    {"name": "vision-1", "interface": "enp2s0", "ip": "192.168.20.10"},
-    {"name": "vision-2", "interface": "enp3s0", "ip": "192.168.30.10"},
-    {"name": "sorting-pc", "interface": "enp4s0", "ip": "192.168.40.10"}
-  ]
-}
